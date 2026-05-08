@@ -9,6 +9,8 @@ import copy, os, shutil, tempfile
 from datetime import datetime, timedelta
 from typing import List, Optional
 
+from updater import VERSION, UpdateChecker, UpdateDialog, RELEASES_URL
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QDialog, QWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
@@ -516,7 +518,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("XALETHER CRYPT v2.1")
         self.resize(900, 760)
+        self._update_checker: Optional[UpdateChecker] = None
         self._build_ui()
+        self._start_update_check()
 
     @property
     def cipher_config(self) -> dict:
@@ -531,7 +535,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(20, 14, 20, 8)
         root.setSpacing(8)
 
-        title = QLabel("XALETHER CRYPT v2.1")
+        title = QLabel(f"XALETHER CRYPT  v{VERSION}")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 25px; font-weight: bold; color: #8A5CF5;")
         root.addWidget(title)
@@ -540,6 +544,28 @@ class MainWindow(QMainWindow):
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet("color: #555; font-size: 11px;")
         root.addWidget(sub)
+
+        # Баннер обновления (скрыт до получения сигнала)
+        self._update_banner = QFrame()
+        self._update_banner.setStyleSheet(
+            "QFrame{background:#1E1500;border:1px solid #8A6A00;"
+            "border-radius:5px;padding:2px;}"
+        )
+        banner_lay = QHBoxLayout(self._update_banner)
+        banner_lay.setContentsMargins(12, 6, 12, 6)
+        self._banner_lbl = QLabel("🔄 Доступно обновление")
+        self._banner_lbl.setStyleSheet("color:#FFD700; font-size:12px;")
+        dl_btn = QPushButton("Скачать")
+        dl_btn.setFixedWidth(100)
+        dl_btn.setStyleSheet(
+            "background:#8A6A00;color:#FFD700;border:none;"
+            "border-radius:4px;padding:4px 10px;"
+        )
+        dl_btn.clicked.connect(self._show_update_dialog)
+        banner_lay.addWidget(self._banner_lbl, 1)
+        banner_lay.addWidget(dl_btn)
+        self._update_banner.setVisible(False)
+        root.addWidget(self._update_banner)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1120,3 +1146,28 @@ class MainWindow(QMainWindow):
         self._set_status("Ошибка")
         self._log(f"❌ {err}")
         QMessageBox.critical(self, "Ошибка", err)
+
+    # ── автообновление ────────────────────────────────────────────────────────
+
+    def _start_update_check(self) -> None:
+        """Запускает тихую фоновую проверку обновлений."""
+        self._update_checker = UpdateChecker()
+        self._update_checker.update_available.connect(self._on_update_found)
+        self._update_checker.failed.connect(
+            lambda e: self._set_status(f"Проверка обновлений: {e}")
+        )
+        self._update_checker.start()
+        self._log("Проверка обновлений…")
+
+    def _on_update_found(self, new_ver: str) -> None:
+        self._new_ver = new_ver
+        self._banner_lbl.setText(
+            f"🔄  Доступно обновление  v{VERSION} → v{new_ver}"
+        )
+        self._update_banner.setVisible(True)
+        self._set_status(f"Доступно обновление v{new_ver}")
+        self._log(f"Найдено обновление: v{new_ver}")
+
+    def _show_update_dialog(self) -> None:
+        dlg = UpdateDialog(self._new_ver, self)
+        dlg.exec_()
