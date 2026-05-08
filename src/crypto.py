@@ -10,7 +10,7 @@ KDF:   PBKDF2-SHA256 · PBKDF2-SHA512 · scrypt · Argon2id
 Сжатие: none · zlib-1 · zlib-9 · bz2 · lzma
 """
 
-import os, gc, zlib, bz2, lzma, json, hashlib, secrets
+import os, gc, zlib, bz2, lzma, json, hashlib, secrets, tempfile
 import hmac as _hmac
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Tuple
@@ -596,6 +596,16 @@ class XaletherChaos:
         if output is None:
             output = filepath + ".xalether"
 
+        # Первый проход: SHA-256 оригинального файла
+        sha_hasher = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            while True:
+                blk = f.read(CHUNK_SIZE)
+                if not blk:
+                    break
+                sha_hasher.update(blk)
+        metadata["sha256"] = sha_hasher.hexdigest()
+
         meta_json = json.dumps(metadata).encode()
 
         with open(filepath, "rb") as fin, open(output, "wb") as fout:
@@ -678,6 +688,9 @@ class XaletherChaos:
             num_chunks  = metadata.get("num_chunks", 0)
             noise_size  = metadata.get("noise_size", 0)
 
+            verify_hash = metadata.get("sha256")
+            sha_hasher  = hashlib.sha256() if verify_hash else None
+
             with open(filepath, "rb") as fin, open(output, "wb") as fout:
                 fin.seek(header_end + noise_size)
                 for i in range(num_chunks):
@@ -686,9 +699,23 @@ class XaletherChaos:
                         raise ValueError(f"Неожиданный конец файла (чанк {i}/{num_chunks})")
                     chunk_size = int.from_bytes(sz_raw, "big")
                     enc_chunk  = fin.read(chunk_size)
-                    fout.write(dec._decrypt_chunk(enc_chunk, compression))
+                    dec_chunk  = dec._decrypt_chunk(enc_chunk, compression)
+                    if sha_hasher:
+                        sha_hasher.update(dec_chunk)
+                    fout.write(dec_chunk)
                     if progress_cb and num_chunks > 0:
-                        progress_cb(30 + int((i + 1) / num_chunks * 65))
+                        progress_cb(30 + int((i + 1) / num_chunks * 60))
+
+            if sha_hasher and sha_hasher.hexdigest() != verify_hash:
+                try:
+                    os.remove(output)
+                except Exception:
+                    pass
+                raise ValueError(
+                    "⚠️ Файл повреждён или изменён!\n"
+                    f"Ожидаемый SHA-256:  {verify_hash[:32]}…\n"
+                    f"Полученный SHA-256: {sha_hasher.hexdigest()[:32]}…"
+                )
 
         else:
             # Не-chunked v2.1 (файлы зашифрованные старой версией программы)
@@ -710,3 +737,49 @@ class XaletherChaos:
             os.remove(filepath)
         if progress_cb: progress_cb(100)
         return output, metadata
+
+
+# ─── Проверка целостности ─────────────────────────────────────────────────────
+
+def verify_integrity(
+    filepath: str,
+    password: str,
+    progress_cb: ProgressCallback = None,
+) -> Tuple[bool, str]:
+    """
+    Проверяет SHA-256 целостность .xalether файла.
+    Расшифровывает во временный файл, вычисляет хеш, сравнивает с метаданными.
+    Возвращает (ok: bool, message: str).
+    """
+    try:
+        meta = read_metadata(filepath)
+    except Exception as e:
+        return False, f"Не удалось прочитать метаданные: {e}"
+
+    if not meta.get("sha256"):
+        return False, (
+            "SHA-256 отсутствует в метаданных.\n"
+            "Файл создан старой версией XALETHER CRYPT (до v2.2)."
+        )
+
+    tmp = tempfile.mktemp(suffix=".xal_verify")
+    try:
+        # decrypt_file не использует self для ключей — создаём минимальный экземпляр
+        instance = object.__new__(XaletherChaos)
+        instance.config = DEFAULT_CONFIG.copy()
+        instance._keys  = []
+        instance.salt   = b"\x00" * SALT_SIZE
+        instance.decrypt_file(filepath, password, output=tmp, progress_cb=progress_cb)
+        return True, "✅ Файл целый — SHA-256 совпадает"
+    except ValueError as e:
+        msg = str(e)
+        if "повреждён" in msg or "SHA-256" in msg or "изменён" in msg:
+            return False, msg
+        return False, f"Ошибка расшифровки: {msg}"
+    except Exception as e:
+        return False, f"Ошибка верификации: {e}"
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass

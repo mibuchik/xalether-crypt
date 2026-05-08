@@ -1,0 +1,10 @@
+Windows Registry Editor Version 5.00
+
+; ============================================================
+; XALETHER CRYPT — Удаление контекстного меню Проводника
+; ============================================================
+
+[-HKEY_CURRENT_USER\Software\Classes\*\shell\XaletherEncrypt]
+[-HKEY_CURRENT_USER\Software\Classes\*\shell\XaletherDecrypt]
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\XaletherEncrypt]
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\XaletherDecrypt]

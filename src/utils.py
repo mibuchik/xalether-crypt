@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Утилиты: ZIP-архивация, история, генератор паролей, настройки."""
+"""Утилиты: ZIP-архивация, история, генератор паролей, настройки, шредер."""
 
 import os
 import json
@@ -10,7 +10,7 @@ import tempfile
 import secrets
 import string
 from datetime import datetime
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 HISTORY_FILE = os.path.expanduser("~/.xalether_history.json")
 SETTINGS_FILE = os.path.expanduser("~/.xalether_settings.json")
@@ -88,6 +88,52 @@ def save_settings(settings: dict) -> None:
     """Сохраняет настройки."""
     with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def shred_file(
+    filepath: str,
+    passes: int = 3,
+    progress_cb: Optional[Callable[[int], None]] = None,
+) -> None:
+    """
+    Безвозвратно уничтожает файл: многопроходная перезапись + переименование + удаление.
+
+    Алгоритм каждого прохода чередует нули и случайные байты.
+    После перезаписи файл переименовывается 3 раза, затем удаляется.
+    """
+    filepath = os.path.abspath(filepath)
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Файл не найден: {filepath}")
+
+    size = os.path.getsize(filepath)
+    CHUNK = 1024 * 1024  # 1 МБ
+
+    def _write_pass(random: bool) -> None:
+        with open(filepath, "r+b") as f:
+            written = 0
+            while written < size:
+                n = min(CHUNK, size - written)
+                f.write(secrets.token_bytes(n) if random else b"\x00" * n)
+                written += n
+            f.flush()
+            os.fsync(f.fileno())
+
+    for i in range(passes):
+        _write_pass(random=(i % 2 == 1))
+        if progress_cb:
+            progress_cb(int((i + 1) / passes * 75))
+
+    # Переименовываем 3 раза перед удалением
+    parent  = os.path.dirname(filepath)
+    current = filepath
+    for _ in range(3):
+        new_name = os.path.join(parent, "." + secrets.token_hex(12))
+        os.rename(current, new_name)
+        current = new_name
+
+    os.remove(current)
+    if progress_cb:
+        progress_cb(100)
 
 
 def generate_password(

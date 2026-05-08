@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-XALETHER CRYPT v2.1 — PyQt5 GUI.
+XALETHER CRYPT v2.2 — PyQt5 GUI.
 Тёмная тема: #1A1A1A / #8A5CF5.
-Интерактивные настройки: конструктор цепочки шифров, выбор KDF, сжатия, пресеты.
+Новое: шредер, проверка целостности, контекстное меню Windows.
 """
 
 import copy, os, shutil, tempfile
@@ -24,15 +24,17 @@ from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent
 
 from crypto import (
     XaletherChaos, save_password_hash, verify_password, is_first_run,
-    read_metadata, CIPHER_INFO, CIPHER_REGISTRY, KDF_INFO, COMPRESS_INFO,
-    PRESETS, DEFAULT_CONFIG,
+    read_metadata, verify_integrity, CIPHER_INFO, CIPHER_REGISTRY,
+    KDF_INFO, COMPRESS_INFO, PRESETS, DEFAULT_CONFIG,
 )
 from permissions import generate_permission_code, create_permission, get_active_permissions
 from utils import (
     folder_to_zip, zip_to_folder,
     save_history_entry, load_history,
     load_settings, save_settings, generate_password,
+    shred_file,
 )
+import context_menu as _ctx
 
 
 # ─── Стиль ────────────────────────────────────────────────────────────────────
@@ -202,7 +204,7 @@ class DropZone(QFrame):
         self._icon.setText("⬇")
 
 
-# ─── Рабочий поток ────────────────────────────────────────────────────────────
+# ─── Рабочие потоки ────────────────────────────────────────────────────────────
 
 class CryptoWorker(QThread):
     progress = pyqtSignal(int)
@@ -226,15 +228,40 @@ class CryptoWorker(QThread):
             self.error.emit(str(exc))
 
     def _encrypt_file(self):
-        crypt = XaletherChaos(self.password, config=self.cipher_config)
-        return crypt.encrypt_file(
-            self.path,
-            mode=self.kwargs.get("mode", "transfer"),
-            permission_code=self.kwargs.get("permission_code"),
-            remove_original=self.kwargs.get("remove_original", False),
-            content_type="file",
-            progress_cb=self.progress.emit,
-        )
+        shred_mode = self.kwargs.get("shred_mode", "none")
+
+        if shred_mode == "shred":
+            # 1. Шифруем во временный файл
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xalether.tmp")
+            os.close(tmp_fd)
+            final_out = self.path + ".xalether"
+
+            crypt = XaletherChaos(self.password, config=self.cipher_config)
+            _, meta = crypt.encrypt_file(
+                self.path, output=tmp_path,
+                mode=self.kwargs.get("mode", "transfer"),
+                permission_code=self.kwargs.get("permission_code"),
+                remove_original=False, content_type="file",
+                progress_cb=lambda p: self.progress.emit(int(p * 0.60)),
+            )
+            # 2. Шредим оригинал
+            shred_file(self.path, passes=3,
+                       progress_cb=lambda p: self.progress.emit(60 + int(p * 0.30)))
+            # 3. Перемещаем tmp → результат
+            shutil.move(tmp_path, final_out)
+            self.progress.emit(100)
+            return final_out, meta
+        else:
+            remove = (shred_mode == "delete")
+            crypt = XaletherChaos(self.password, config=self.cipher_config)
+            return crypt.encrypt_file(
+                self.path,
+                mode=self.kwargs.get("mode", "transfer"),
+                permission_code=self.kwargs.get("permission_code"),
+                remove_original=remove,
+                content_type="file",
+                progress_cb=self.progress.emit,
+            )
 
     def _decrypt_file(self):
         crypt = XaletherChaos(self.password, config=self.cipher_config)
@@ -258,8 +285,9 @@ class CryptoWorker(QThread):
             progress_cb=lambda p: self.progress.emit(30 + int(p * 0.6)),
         )
         os.remove(zip_path)
-        if self.kwargs.get("remove_original", False):
-            shutil.rmtree(self.path)
+        shred_mode = self.kwargs.get("shred_mode", "none")
+        if shred_mode != "none":
+            shutil.rmtree(self.path, ignore_errors=True)
         self.progress.emit(100)
         return out, meta
 
@@ -281,6 +309,44 @@ class CryptoWorker(QThread):
             os.remove(self.path)
         self.progress.emit(100)
         return out_dir, meta
+
+
+class ShredWorker(QThread):
+    """Безвозвратно уничтожает файл в фоновом потоке."""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal()
+    error    = pyqtSignal(str)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+
+    def run(self) -> None:
+        try:
+            shred_file(self.path, passes=3, progress_cb=self.progress.emit)
+            self.finished.emit()
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class IntegrityWorker(QThread):
+    """Проверяет SHA-256 целостность .xalether файла."""
+    result   = pyqtSignal(bool, str)
+    progress = pyqtSignal(int)
+    error    = pyqtSignal(str)
+
+    def __init__(self, path: str, password: str) -> None:
+        super().__init__()
+        self.path     = path
+        self.password = password
+
+    def run(self) -> None:
+        try:
+            ok, msg = verify_integrity(self.path, self.password,
+                                       progress_cb=self.progress.emit)
+            self.result.emit(ok, msg)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 # ─── Вспомогательные диалоги ─────────────────────────────────────────────────
@@ -314,7 +380,7 @@ class PermissionCodeDialog(QDialog):
 class LoginDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("XALETHER CRYPT v2.1")
+        self.setWindowTitle("XALETHER CRYPT v2.2")
         self.setFixedSize(460, 340)
         self.password: str = ""
         self._first = is_first_run()
@@ -325,7 +391,7 @@ class LoginDialog(QDialog):
         lay.setContentsMargins(40, 30, 40, 30)
         lay.setSpacing(14)
 
-        t = QLabel("XALETHER CRYPT v2.1")
+        t = QLabel("XALETHER CRYPT v2.2")
         t.setAlignment(Qt.AlignCenter)
         t.setStyleSheet("font-size: 22px; font-weight: bold; color: #8A5CF5;")
         lay.addWidget(t)
@@ -379,10 +445,6 @@ class LoginDialog(QDialog):
 # ─── Конструктор цепочки шифров ───────────────────────────────────────────────
 
 class CipherChainEditor(QWidget):
-    """
-    Виджет для интерактивного построения цепочки шифров.
-    Показывает текущую цепочку, позволяет добавлять/удалять/перемещать слои.
-    """
     changed = pyqtSignal()
 
     def __init__(self, parent=None) -> None:
@@ -394,14 +456,12 @@ class CipherChainEditor(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
 
-        # Список текущей цепочки
         self._list = QListWidget()
         self._list.setFixedHeight(140)
         self._list.setDragDropMode(QAbstractItemView.InternalMove)
         self._list.model().rowsMoved.connect(lambda: self.changed.emit())
         root.addWidget(self._list)
 
-        # Строка кнопок управления
         ctrl = QHBoxLayout()
         ctrl.setSpacing(6)
 
@@ -433,7 +493,6 @@ class CipherChainEditor(QWidget):
 
         root.addLayout(ctrl)
 
-        # Подсказка к выбранному шифру
         self._desc = QLabel("")
         self._desc.setStyleSheet("color: #666; font-size: 11px;")
         self._desc.setWordWrap(True)
@@ -491,8 +550,6 @@ class CipherChainEditor(QWidget):
             self._list.setCurrentRow(r + 1)
             self.changed.emit()
 
-    # ── API ─────────────────────────────────────────────────────────────────
-
     def get_chain(self) -> List[str]:
         return [self._list.item(i).data(Qt.UserRole) for i in range(self._list.count())]
 
@@ -509,15 +566,17 @@ class MainWindow(QMainWindow):
     def __init__(self, password: str) -> None:
         super().__init__()
         self.password = password
-        self._worker: Optional[CryptoWorker] = None
+        self._worker:           Optional[CryptoWorker]   = None
+        self._shred_worker:     Optional[ShredWorker]    = None
+        self._integrity_worker: Optional[IntegrityWorker]= None
 
         self.settings = load_settings()
         self._cipher_config: dict = copy.deepcopy(
             self.settings.get("cipher_config", DEFAULT_CONFIG)
         )
 
-        self.setWindowTitle("XALETHER CRYPT v2.1")
-        self.resize(900, 760)
+        self.setWindowTitle(f"XALETHER CRYPT v{VERSION}")
+        self.resize(900, 780)
         self._update_checker: Optional[UpdateChecker] = None
         self._build_ui()
         self._start_update_check()
@@ -540,12 +599,12 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("font-size: 25px; font-weight: bold; color: #8A5CF5;")
         root.addWidget(title)
 
-        sub = QLabel("Каскадное шифрование · 9 алгоритмов · 4 KDF · настраиваемые цепочки")
+        sub = QLabel("Каскадное шифрование · 9 алгоритмов · 4 KDF · шредер · проверка целостности")
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet("color: #555; font-size: 11px;")
         root.addWidget(sub)
 
-        # Баннер обновления (скрыт до получения сигнала)
+        # Баннер обновления
         self._update_banner = QFrame()
         self._update_banner.setStyleSheet(
             "QFrame{background:#1E1500;border:1px solid #8A6A00;"
@@ -601,7 +660,7 @@ class MainWindow(QMainWindow):
         self.drop_zone.files_dropped.connect(self._on_drop)
         lay.addWidget(self.drop_zone)
 
-        # Режим шифрования + карточка конфига — рядом
+        # Режим + карточка конфига
         row = QHBoxLayout()
         row.setSpacing(12)
 
@@ -622,7 +681,6 @@ class MainWindow(QMainWindow):
             mode_lay.addWidget(rb)
         row.addWidget(mode_box)
 
-        # Карточка текущей конфигурации шифрования
         self._config_card = QFrame()
         self._config_card.setObjectName("config_card")
         card_lay = QVBoxLayout(self._config_card)
@@ -630,10 +688,10 @@ class MainWindow(QMainWindow):
         card_lay.setSpacing(3)
         card_title = QLabel("Текущая конфигурация")
         card_title.setStyleSheet("color: #8A5CF5; font-weight: bold; font-size: 11px;")
-        self._card_chain = QLabel("...")
+        self._card_chain    = QLabel("...")
         self._card_chain.setStyleSheet("color: #E3E3E3; font-size: 12px;")
         self._card_chain.setWordWrap(True)
-        self._card_kdf = QLabel("...")
+        self._card_kdf      = QLabel("...")
         self._card_kdf.setStyleSheet("color: #888; font-size: 11px;")
         self._card_compress = QLabel("...")
         self._card_compress.setStyleSheet("color: #888; font-size: 11px;")
@@ -645,33 +703,74 @@ class MainWindow(QMainWindow):
         row.addWidget(self._config_card, 1)
         lay.addLayout(row)
 
-        # Опции
+        # Параметры — оригинал + расшифровка
         opts_box = QGroupBox("Параметры")
-        opts_lay = QHBoxLayout(opts_box)
-        self._rm_orig = QCheckBox("Удалять оригинал после шифрования")
-        self._rm_orig.setChecked(self.settings.get("remove_original", True))
-        self._rm_enc  = QCheckBox("Удалять .xalether после расшифровки")
+        opts_lay = QVBoxLayout(opts_box)
+        opts_lay.setSpacing(6)
+
+        orig_lbl = QLabel("Оригинал после шифрования:")
+        orig_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        opts_lay.addWidget(orig_lbl)
+
+        orig_row = QHBoxLayout()
+        orig_row.setSpacing(16)
+        self._orig_grp = QButtonGroup(self)
+        saved_shred = self.settings.get("shred_mode", "delete")
+        for label, val, style in [
+            ("Оставить",                  "none",   ""),
+            ("Удалить",                   "delete", ""),
+            ("🗑 Уничтожить (шредер)",    "shred",  "color: #FF6B6B;"),
+        ]:
+            rb = QRadioButton(label)
+            rb.setProperty("shred_val", val)
+            rb.setChecked(val == saved_shred)
+            if style:
+                rb.setStyleSheet(style)
+            self._orig_grp.addButton(rb)
+            orig_row.addWidget(rb)
+        orig_row.addStretch()
+        opts_lay.addLayout(orig_row)
+
+        self._rm_enc = QCheckBox("Удалять .xalether после расшифровки")
         self._rm_enc.setChecked(self.settings.get("remove_encrypted", True))
-        opts_lay.addWidget(self._rm_orig)
         opts_lay.addWidget(self._rm_enc)
         lay.addWidget(opts_box)
 
-        # Кнопки
+        # Главные кнопки
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         for text, slot in [
-            ("🔒 Зашифровать файл", self._encrypt_file),
-            ("🔓 Расшифровать", self._decrypt_auto),
-            ("📁 Зашифровать папку", self._encrypt_folder),
+            ("🔒 Зашифровать файл",    self._encrypt_file),
+            ("🔓 Расшифровать",        self._decrypt_auto),
+            ("📁 Зашифровать папку",   self._encrypt_folder),
         ]:
             b = QPushButton(text)
             b.setFixedHeight(38)
             b.clicked.connect(slot)
             btn_row.addWidget(b)
         lay.addLayout(btn_row)
+
+        # Дополнительные кнопки
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(8)
+
+        integrity_btn = QPushButton("🔍 Проверить целостность")
+        integrity_btn.setFixedHeight(34)
+        integrity_btn.setToolTip("Проверяет SHA-256 файла .xalether без сохранения расшифрованных данных")
+        integrity_btn.clicked.connect(self._check_integrity)
+        btn_row2.addWidget(integrity_btn)
+
+        shred_btn = QPushButton("🗑 Уничтожить файл")
+        shred_btn.setObjectName("danger")
+        shred_btn.setFixedHeight(34)
+        shred_btn.setToolTip("Безвозвратное 3-проходное уничтожение файла (без шифрования)")
+        shred_btn.clicked.connect(self._shred_standalone)
+        btn_row2.addWidget(shred_btn)
+
+        lay.addLayout(btn_row2)
         lay.addStretch()
 
-    # ── вкладка Настройки (интерактивные) ────────────────────────────────────
+    # ── вкладка Настройки ────────────────────────────────────────────────────
 
     def _build_settings_tab(self) -> None:
         outer = QWidget()
@@ -692,7 +791,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(18, 14, 18, 14)
         lay.setSpacing(14)
 
-        # ── Пресеты ──────────────────────────────────────────────────────────
+        # Пресеты
         pbox = QGroupBox("Пресеты")
         play = QHBoxLayout(pbox)
         play.setSpacing(8)
@@ -704,24 +803,22 @@ class MainWindow(QMainWindow):
             play.addWidget(b)
         lay.addWidget(pbox)
 
-        # ── Цепочка шифров ───────────────────────────────────────────────────
+        # Цепочка шифров
         chain_box = QGroupBox("Цепочка шифров  (drag to reorder)")
         chain_lay = QVBoxLayout(chain_box)
         self._chain_editor = CipherChainEditor()
         self._chain_editor.set_chain(self._cipher_config["cipher_chain"])
         self._chain_editor.changed.connect(self._on_chain_changed)
         chain_lay.addWidget(self._chain_editor)
-
         hint = QLabel("Шифры применяются слева-направо. Последний — внешний слой.")
         hint.setStyleSheet("color: #555; font-size: 11px;")
         chain_lay.addWidget(hint)
         lay.addWidget(chain_box)
 
-        # ── KDF ──────────────────────────────────────────────────────────────
+        # KDF
         kdf_box = QGroupBox("Алгоритм деривации ключей (KDF)")
         kdf_lay = QVBoxLayout(kdf_box)
         kdf_lay.setSpacing(6)
-
         self._kdf_grp = QButtonGroup(self)
         cur_kdf = self._cipher_config.get("kdf", {}).get("type", "pbkdf2-sha256")
         for kid, kinfo in KDF_INFO.items():
@@ -733,8 +830,6 @@ class MainWindow(QMainWindow):
             rb.toggled.connect(self._on_kdf_changed)
             self._kdf_grp.addButton(rb)
             kdf_lay.addWidget(rb)
-
-        # Итерации (для PBKDF2)
         iter_row = QHBoxLayout()
         iter_row.addWidget(QLabel("Итерации:"))
         self._iter_spin = QSpinBox()
@@ -753,7 +848,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(kdf_box)
         self._refresh_iter_visibility()
 
-        # ── Сжатие ───────────────────────────────────────────────────────────
+        # Сжатие
         comp_box = QGroupBox("Сжатие данных")
         comp_lay = QVBoxLayout(comp_box)
         comp_lay.setSpacing(4)
@@ -769,7 +864,7 @@ class MainWindow(QMainWindow):
             comp_lay.addWidget(rb)
         lay.addWidget(comp_box)
 
-        # ── Сводка ──────────────────────────────────────────────────────────
+        # Сводка
         summary_box = QGroupBox("Текущая конфигурация")
         summary_lay = QVBoxLayout(summary_box)
         self._summary_lbl = QLabel("")
@@ -780,7 +875,42 @@ class MainWindow(QMainWindow):
         summary_lay.addWidget(self._summary_lbl)
         lay.addWidget(summary_box)
 
-        # ── Кнопка сохранения ────────────────────────────────────────────────
+        # Контекстное меню Windows
+        ctx_box = QGroupBox("Контекстное меню Windows")
+        ctx_lay = QVBoxLayout(ctx_box)
+        ctx_lay.setSpacing(8)
+
+        ctx_info = QLabel(
+            "Добавляет пункты «Зашифровать Xalether» и «Расшифровать Xalether»\n"
+            "в контекстное меню Проводника (ПКМ по файлу или папке).\n"
+            "Не требует прав администратора."
+        )
+        ctx_info.setStyleSheet("color: #888; font-size: 11px;")
+        ctx_info.setWordWrap(True)
+        ctx_lay.addWidget(ctx_info)
+
+        self._ctx_status_lbl = QLabel("")
+        self._ctx_status_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
+        ctx_lay.addWidget(self._ctx_status_lbl)
+
+        ctx_btn_row = QHBoxLayout()
+        ctx_btn_row.setSpacing(8)
+        install_btn = QPushButton("✅ Добавить в контекстное меню")
+        install_btn.clicked.connect(self._install_ctx_menu)
+        uninstall_btn = QPushButton("❌ Убрать из контекстного меню")
+        uninstall_btn.setObjectName("danger")
+        uninstall_btn.clicked.connect(self._uninstall_ctx_menu)
+        reg_btn = QPushButton("📄 Сохранить .reg файлы")
+        reg_btn.setToolTip("Сохранить install/uninstall .reg файлы с текущими путями")
+        reg_btn.clicked.connect(self._save_reg_files)
+        ctx_btn_row.addWidget(install_btn)
+        ctx_btn_row.addWidget(uninstall_btn)
+        ctx_btn_row.addWidget(reg_btn)
+        ctx_lay.addLayout(ctx_btn_row)
+        lay.addWidget(ctx_box)
+        self._refresh_ctx_status()
+
+        # Сохранить
         save_btn = QPushButton("💾  Сохранить настройки")
         save_btn.setObjectName("accent")
         save_btn.setFixedHeight(38)
@@ -877,7 +1007,7 @@ class MainWindow(QMainWindow):
         clr.setFixedWidth(120)
         clr.clicked.connect(self._log_view.clear)
         lay.addWidget(clr)
-        self._log("XALETHER CRYPT v2.1 готов")
+        self._log("XALETHER CRYPT v2.2 готов")
 
     # ── логика настроек ───────────────────────────────────────────────────────
 
@@ -888,7 +1018,6 @@ class MainWindow(QMainWindow):
             "kdf":          dict(p["kdf"]),
             "compression":  p["compression"],
         }
-        # Синхронизируем UI
         self._chain_editor.set_chain(self._cipher_config["cipher_chain"])
         kdf_type = self._cipher_config["kdf"]["type"]
         for btn in self._kdf_grp.buttons():
@@ -941,11 +1070,11 @@ class MainWindow(QMainWindow):
         kdf   = self._cipher_config.get("kdf", {})
         comp  = self._cipher_config.get("compression", "zlib-9")
 
-        labels = [CIPHER_INFO.get(c, {}).get("label", c) for c in chain]
-        chain_str = " → ".join(labels) if labels else "⚠ Нет шифров (данные не шифруются!)"
+        labels    = [CIPHER_INFO.get(c, {}).get("label", c) for c in chain]
+        chain_str = " → ".join(labels) if labels else "⚠ Нет шифров"
         kdf_label = KDF_INFO.get(kdf.get("type",""), {}).get("label", kdf.get("type","?"))
-        iters = kdf.get("iterations")
-        kdf_str = f"{kdf_label}" + (f", {iters:,} итераций" if iters else "")
+        iters     = kdf.get("iterations")
+        kdf_str   = f"{kdf_label}" + (f", {iters:,} итераций" if iters else "")
         comp_str  = COMPRESS_INFO.get(comp, {}).get("label", comp)
 
         text = (
@@ -958,7 +1087,6 @@ class MainWindow(QMainWindow):
             self._summary_lbl.setText(text)
 
     def _update_config_card(self) -> None:
-        """Обновляет карточку конфига на вкладке Шифрование."""
         if not hasattr(self, "_card_chain"):
             return
         chain = self._cipher_config.get("cipher_chain", [])
@@ -978,8 +1106,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Предупреждение",
                 "Цепочка шифров пуста! Добавьте хотя бы один алгоритм.")
             return
-        self.settings["remove_original"]  = self._rm_orig.isChecked()
         self.settings["remove_encrypted"] = self._rm_enc.isChecked()
+        self.settings["shred_mode"]       = self._get_shred_mode()
         self.settings["default_mode"]     = self._get_mode()
         self.settings["cipher_config"]    = copy.deepcopy(self._cipher_config)
         save_settings(self.settings)
@@ -1000,6 +1128,12 @@ class MainWindow(QMainWindow):
             if btn.isChecked():
                 return btn.property("mode_val")
         return "transfer"
+
+    def _get_shred_mode(self) -> str:
+        for btn in self._orig_grp.buttons():
+            if btn.isChecked():
+                return btn.property("shred_val")
+        return "delete"
 
     def _refresh_permissions(self) -> None:
         perms = get_active_permissions()
@@ -1068,6 +1202,124 @@ class MainWindow(QMainWindow):
         if folder:
             self._run_operation("encrypt_folder", folder)
 
+    # ── шредер (отдельный) ────────────────────────────────────────────────────
+
+    def _shred_standalone(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл для уничтожения")
+        if not path:
+            return
+        reply = QMessageBox.warning(
+            self, "⚠️ Внимание — безвозвратное уничтожение",
+            f"Файл будет БЕЗВОЗВРАТНО уничтожен (3 прохода перезаписи):\n\n"
+            f"{path}\n\n"
+            "Восстановить будет НЕВОЗМОЖНО!\n\nПродолжить?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        if self._shred_worker and self._shred_worker.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения шредера.")
+            return
+
+        self.progress.setValue(0)
+        self._set_status("🗑 Уничтожение файла…")
+        self._log(f"🗑 Шредер: {os.path.basename(path)}")
+
+        self._shred_worker = ShredWorker(path)
+        self._shred_worker.progress.connect(self.progress.setValue)
+        self._shred_worker.finished.connect(lambda: self._on_shred_done(path))
+        self._shred_worker.error.connect(self._on_error)
+        self._shred_worker.start()
+
+    def _on_shred_done(self, path: str) -> None:
+        self.progress.setValue(100)
+        self._set_status("Уничтожено")
+        self._log(f"✅ Файл уничтожен: {os.path.basename(path)}")
+        QMessageBox.information(self, "Шредер", f"✅ Файл безвозвратно уничтожен:\n{path}")
+
+    # ── проверка целостности ──────────────────────────────────────────────────
+
+    def _check_integrity(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Проверка целостности", filter="Xalether (*.xalether);;Все (*)"
+        )
+        if not path:
+            return
+
+        if self._integrity_worker and self._integrity_worker.isRunning():
+            QMessageBox.warning(self, "Занято", "Дождитесь завершения проверки.")
+            return
+
+        self.progress.setValue(0)
+        self._set_status("🔍 Проверка целостности…")
+        self._log(f"🔍 Проверка: {os.path.basename(path)}")
+
+        self._integrity_worker = IntegrityWorker(path, self.password)
+        self._integrity_worker.progress.connect(self.progress.setValue)
+        self._integrity_worker.result.connect(self._on_integrity_result)
+        self._integrity_worker.error.connect(self._on_error)
+        self._integrity_worker.start()
+
+    def _on_integrity_result(self, ok: bool, msg: str) -> None:
+        self.progress.setValue(100)
+        if ok:
+            self._set_status("✅ Файл целый")
+            self._log("✅ Целостность подтверждена")
+            QMessageBox.information(self, "Проверка целостности", msg)
+        else:
+            self._set_status("⚠️ Файл повреждён!")
+            self._log(f"⚠️ {msg}")
+            QMessageBox.warning(self, "⚠️ Проверка целостности", msg)
+
+    # ── контекстное меню Windows ──────────────────────────────────────────────
+
+    def _install_ctx_menu(self) -> None:
+        ok, msg = _ctx.install()
+        if ok:
+            QMessageBox.information(self, "Контекстное меню", msg)
+            self._log(f"✅ {msg}")
+        else:
+            QMessageBox.critical(self, "Ошибка", msg)
+            self._log(f"❌ {msg}")
+        self._refresh_ctx_status()
+
+    def _uninstall_ctx_menu(self) -> None:
+        ok, msg = _ctx.uninstall()
+        if ok:
+            QMessageBox.information(self, "Контекстное меню", msg)
+            self._log(f"✅ {msg}")
+        else:
+            QMessageBox.critical(self, "Ошибка", msg)
+            self._log(f"❌ {msg}")
+        self._refresh_ctx_status()
+
+    def _save_reg_files(self) -> None:
+        out_dir = QFileDialog.getExistingDirectory(self, "Папка для .reg файлов")
+        if not out_dir:
+            return
+        try:
+            inst, unin = _ctx.generate_reg_files(out_dir)
+            QMessageBox.information(
+                self, "REG файлы сохранены",
+                f"Файлы сохранены:\n{inst}\n{unin}\n\n"
+                "Запустите install_context_menu.reg для добавления меню."
+            )
+            self._log(f"✅ .reg файлы сохранены в {out_dir}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _refresh_ctx_status(self) -> None:
+        if not hasattr(self, "_ctx_status_lbl"):
+            return
+        if _ctx.is_installed():
+            self._ctx_status_lbl.setText("✅ Контекстное меню установлено")
+            self._ctx_status_lbl.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        else:
+            self._ctx_status_lbl.setText("❌ Контекстное меню не установлено")
+            self._ctx_status_lbl.setStyleSheet("color: #FF6B6B; font-weight: bold;")
+
     # ── запуск потока ─────────────────────────────────────────────────────────
 
     def _run_operation(self, operation: str, path: str) -> None:
@@ -1112,7 +1364,7 @@ class MainWindow(QMainWindow):
             cipher_config=copy.deepcopy(self._cipher_config),
             mode=mode,
             permission_code=perm_code,
-            remove_original=self._rm_orig.isChecked(),
+            shred_mode=self._get_shred_mode(),
             remove_encrypted=self._rm_enc.isChecked(),
         )
         self._worker.progress.connect(self.progress.setValue)
@@ -1128,11 +1380,14 @@ class MainWindow(QMainWindow):
         self._refresh_permissions()
         save_history_entry(op, orig, meta.get("mode", "?"), success=True)
 
-        chain = meta.get("cipher_chain", [])
+        chain     = meta.get("cipher_chain", [])
         chain_str = " → ".join(CIPHER_INFO.get(c, {}).get("label", c) for c in chain)
+        sha256    = meta.get("sha256", "")
         msg = f"Готово!\n\n📂 {output}"
         if chain_str:
             msg += f"\n\n🔗 {chain_str}"
+        if sha256:
+            msg += f"\n🔑 SHA-256: {sha256[:32]}…"
         if perm_code and op.startswith("encrypt"):
             QApplication.clipboard().setText(perm_code)
             msg += f"\n\n🎫 Код:\n{perm_code}\n(скопирован)"
@@ -1150,7 +1405,6 @@ class MainWindow(QMainWindow):
     # ── автообновление ────────────────────────────────────────────────────────
 
     def _start_update_check(self) -> None:
-        """Запускает тихую фоновую проверку обновлений."""
         self._update_checker = UpdateChecker()
         self._update_checker.update_available.connect(self._on_update_found)
         self._update_checker.failed.connect(
