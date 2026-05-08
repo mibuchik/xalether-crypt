@@ -33,6 +33,7 @@ from permissions import use_permission
 
 SALT_SIZE  = 16
 KEY_BLOCK  = 64          # байт ключевого материала на один слой
+CHUNK_SIZE = 32 * 1024 * 1024   # 32 МБ — размер блока потокового шифрования
 CONFIG_FILE = os.path.expanduser("~/.xalether_crypt_config.json")
 AAD = b'XALETHER_CRYPT_V2'
 
@@ -493,6 +494,27 @@ class XaletherChaos:
             self._keys = []
         gc.collect()
 
+    # ── потоковые чанки ───────────────────────────────────────────────────────
+
+    def _encrypt_chunk(self, chunk_data: bytes, compression: str) -> bytes:
+        """Сжимает и каскадно шифрует один чанк. Каждый вызов даёт случайный nonce."""
+        data = compress_data(chunk_data, compression)
+        chain = self.config["cipher_chain"]
+        for i, cid in enumerate(chain):
+            data = CIPHER_REGISTRY[cid].encrypt(self._keys[i], data)
+        return data
+
+    def _decrypt_chunk(self, chunk_data: bytes, compression: str) -> bytes:
+        """Каскадно расшифровывает и разжимает один чанк."""
+        data = chunk_data
+        chain = self.config["cipher_chain"]
+        for i in range(len(chain) - 1, -1, -1):
+            layer = CIPHER_REGISTRY.get(chain[i])
+            if layer is None:
+                raise ValueError(f"Неизвестный шифр: {chain[i]}")
+            data = layer.decrypt(self._keys[i], data)
+        return decompress_data(data, compression)
+
     # ── шифрование ────────────────────────────────────────────────────────────
 
     def encrypt(
@@ -551,26 +573,54 @@ class XaletherChaos:
         content_type: str = "file",
         progress_cb: ProgressCallback = None,
     ) -> Tuple[str, dict]:
-        with open(filepath, "rb") as f:
-            data = f.read()
-        if progress_cb: progress_cb(10)
+        chain = self.config["cipher_chain"]
+        compression = self.config.get("compression", "zlib-9")
 
-        encrypted, metadata = self.encrypt(data, mode, permission_code, content_type)
-        if progress_cb: progress_cb(80)
+        file_size = os.path.getsize(filepath)
+        num_chunks = max(1, (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE) if file_size > 0 else 1
+
+        metadata = {
+            "version": "2.1",
+            "chunked": True,
+            "num_chunks": num_chunks,
+            "mode": mode,
+            "content_type": content_type,
+            "cipher_chain": chain,
+            "kdf": self.config.get("kdf"),
+            "compression": compression,
+            "noise_size": 0,
+            "hwid": get_hwid() if mode == "personal" else None,
+            "permission_code": permission_code if mode == "permission" else None,
+        }
 
         if output is None:
             output = filepath + ".xalether"
+
         meta_json = json.dumps(metadata).encode()
-        with open(output, "wb") as f:
-            f.write(len(meta_json).to_bytes(4, "big"))
-            f.write(meta_json)
-            f.write(self.salt)
-            f.write(encrypted)
-        if progress_cb: progress_cb(95)
+
+        with open(filepath, "rb") as fin, open(output, "wb") as fout:
+            fout.write(len(meta_json).to_bytes(4, "big"))
+            fout.write(meta_json)
+            fout.write(self.salt)
+
+            bytes_done = 0
+            chunk_idx = 0
+            while True:
+                chunk = fin.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                enc_chunk = self._encrypt_chunk(chunk, compression)
+                fout.write(len(enc_chunk).to_bytes(4, "big"))
+                fout.write(enc_chunk)
+                bytes_done += len(chunk)
+                chunk_idx += 1
+                if progress_cb and file_size > 0:
+                    progress_cb(int(bytes_done / file_size * 95))
 
         if remove_original:
             os.remove(filepath)
-        if progress_cb: progress_cb(100)
+        if progress_cb:
+            progress_cb(100)
         return output, metadata
 
     def decrypt_file(
@@ -582,11 +632,12 @@ class XaletherChaos:
         remove_encrypted: bool = False,
         progress_cb: ProgressCallback = None,
     ) -> Tuple[str, dict]:
+        # Read only the header — don't load the whole file into RAM
         with open(filepath, "rb") as f:
-            meta_len = int.from_bytes(f.read(4), "big")
-            metadata = json.loads(f.read(meta_len).decode())
-            salt     = f.read(SALT_SIZE)
-            encrypted= f.read()
+            meta_len_int = int.from_bytes(f.read(4), "big")
+            metadata     = json.loads(f.read(meta_len_int).decode())
+            salt         = f.read(SALT_SIZE)
+        header_end = 4 + meta_len_int + SALT_SIZE
         if progress_cb: progress_cb(10)
 
         mode = metadata.get("mode", "transfer")
@@ -599,11 +650,51 @@ class XaletherChaos:
                 raise ValueError("Неверный или просроченный код разрешения")
         if progress_cb: progress_cb(20)
 
-        # Выбираем стратегию расшифровки по версии файла
+        if output is None:
+            output = filepath[:-9] if filepath.endswith(".xalether") else filepath + ".decrypted"
+
         version = metadata.get("version", "2.0")
+
         if version == "2.0":
+            # Старый формат — читаем целиком (файлы небольшие)
+            with open(filepath, "rb") as f:
+                f.seek(header_end)
+                encrypted = f.read()
             decrypted = _decrypt_v2_legacy(password, salt, encrypted)
+            with open(output, "wb") as f:
+                f.write(decrypted)
+
+        elif metadata.get("chunked"):
+            # Новый потоковый формат — читаем по чанкам
+            config = {
+                "cipher_chain": metadata["cipher_chain"],
+                "kdf":          metadata["kdf"],
+                "compression":  metadata.get("compression", "zlib-9"),
+            }
+            dec = XaletherChaos(password, salt, config)
+            if progress_cb: progress_cb(30)
+
+            compression = metadata.get("compression", "zlib-9")
+            num_chunks  = metadata.get("num_chunks", 0)
+            noise_size  = metadata.get("noise_size", 0)
+
+            with open(filepath, "rb") as fin, open(output, "wb") as fout:
+                fin.seek(header_end + noise_size)
+                for i in range(num_chunks):
+                    sz_raw = fin.read(4)
+                    if len(sz_raw) < 4:
+                        raise ValueError(f"Неожиданный конец файла (чанк {i}/{num_chunks})")
+                    chunk_size = int.from_bytes(sz_raw, "big")
+                    enc_chunk  = fin.read(chunk_size)
+                    fout.write(dec._decrypt_chunk(enc_chunk, compression))
+                    if progress_cb and num_chunks > 0:
+                        progress_cb(30 + int((i + 1) / num_chunks * 65))
+
         else:
+            # Не-chunked v2.1 (файлы зашифрованные старой версией программы)
+            with open(filepath, "rb") as f:
+                f.seek(header_end)
+                encrypted = f.read()
             config = {
                 "cipher_chain": metadata["cipher_chain"],
                 "kdf":          metadata["kdf"],
@@ -612,14 +703,8 @@ class XaletherChaos:
             dec = XaletherChaos(password, salt, config)
             if progress_cb: progress_cb(50)
             decrypted = dec.decrypt(encrypted, metadata)
-
-        if progress_cb: progress_cb(88)
-
-        if output is None:
-            output = filepath[:-9] if filepath.endswith(".xalether") else filepath + ".decrypted"
-
-        with open(output, "wb") as f:
-            f.write(decrypted)
+            with open(output, "wb") as f:
+                f.write(decrypted)
 
         if remove_encrypted:
             os.remove(filepath)
