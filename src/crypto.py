@@ -1,98 +1,499 @@
 #!/usr/bin/env python3
 """
-Каскадное шифрование XALETHER CRYPT v2.0.
-Алгоритм: AES-256-GCM → ChaCha20-Poly1305
-Деривация ключей: PBKDF2-SHA256, 500 000 итераций
+XALETHER CRYPT v2.1 — Модульная каскадная криптосистема.
+
+Шифры: AES-256-GCM · ChaCha20-Poly1305 · AES-256-SIV
+       AES-256-CBC · AES-256-CTR · Camellia-256-CBC · 3DES-CBC
+
+KDF:   PBKDF2-SHA256 · PBKDF2-SHA512 · scrypt · Argon2id
+
+Сжатие: none · zlib-1 · zlib-9 · bz2 · lzma
 """
 
-import os
-import gc
-import zlib
-import json
-import secrets
-import hashlib
-from typing import Callable, Optional, Tuple
+import os, gc, zlib, bz2, lzma, json, hashlib, secrets
+import hmac as _hmac
+from abc import ABC, abstractmethod
+from typing import Callable, Dict, List, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305, AESSIV
+from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+# TripleDES переехал в decrepit в cryptography >= 43
+try:
+    from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES as _TripleDES
+except ImportError:
+    from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES as _TripleDES  # type: ignore
 
 from utils import get_hwid
 from permissions import use_permission
 
-SALT_SIZE = 16
+# ─── Константы ───────────────────────────────────────────────────────────────
+
+SALT_SIZE  = 16
+KEY_BLOCK  = 64          # байт ключевого материала на один слой
 CONFIG_FILE = os.path.expanduser("~/.xalether_crypt_config.json")
+AAD = b'XALETHER_CRYPT_V2'
 
 ProgressCallback = Optional[Callable[[int], None]]
 
 
-# ─── Пароль ──────────────────────────────────────────────────────────────────
+# ─── Паддинг ─────────────────────────────────────────────────────────────────
+
+def _pad(data: bytes, block: int = 16) -> bytes:
+    n = block - (len(data) % block)
+    return data + bytes([n] * n)
+
+def _unpad(data: bytes, block: int = 16) -> bytes:
+    n = data[-1]
+    return data[:-n] if (1 <= n <= block and data[-n:] == bytes([n] * n)) else data
+
+
+# ─── Абстрактный слой шифрования ─────────────────────────────────────────────
+
+class CipherLayer(ABC):
+    id: str
+    label: str
+    description: str
+    security: str   # Low / Medium / High / Overkill
+
+    @abstractmethod
+    def encrypt(self, key_block: bytes, data: bytes) -> bytes: ...
+
+    @abstractmethod
+    def decrypt(self, key_block: bytes, data: bytes) -> bytes: ...
+
+
+# ─── Реализации шифров ────────────────────────────────────────────────────────
+
+class AesGcmLayer(CipherLayer):
+    id = "aes-gcm";   label = "AES-256-GCM"
+    description = "NIST/FIPS стандарт · аппаратное ускорение (AES-NI) · 128-бит тег"
+    security = "High"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        n = os.urandom(12)
+        return n + AESGCM(kb[:32]).encrypt(n, data, AAD)
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        return AESGCM(kb[:32]).decrypt(data[:12], data[12:], AAD)
+
+
+class ChaCha20Layer(CipherLayer):
+    id = "chacha20";  label = "ChaCha20-Poly1305"
+    description = "IETF RFC 8439 · быстрый на ARM/мобильных без AES-NI · 128-бит тег"
+    security = "High"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        n = os.urandom(12)
+        return n + ChaCha20Poly1305(kb[:32]).encrypt(n, data, AAD)
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        return ChaCha20Poly1305(kb[:32]).decrypt(data[:12], data[12:], AAD)
+
+
+class AesSivLayer(CipherLayer):
+    id = "aes-siv";   label = "AES-256-SIV"
+    description = "Детерминированное AEAD · устойчиво к повтору nonce · двойной AES"
+    security = "High"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        return AESSIV(kb[:64]).encrypt(data, [AAD])   # нет nonce, тег 16 байт
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        return AESSIV(kb[:64]).decrypt(data, [AAD])
+
+
+class AesCbcLayer(CipherLayer):
+    id = "aes-cbc";   label = "AES-256-CBC + HMAC-SHA256"
+    description = "Классический блочный режим · Encrypt-then-MAC · FIPS 140-2 совместим"
+    security = "Medium"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv = os.urandom(16)
+        enc = Cipher(algorithms.AES(ek), modes.CBC(iv), backend=default_backend()).encryptor()
+        ct  = enc.update(_pad(data)) + enc.finalize()
+        tag = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        return iv + tag + ct                 # 16 + 32 + padded
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv, tag, ct = data[:16], data[16:48], data[48:]
+        exp = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("AES-CBC: ошибка аутентификации")
+        dec = Cipher(algorithms.AES(ek), modes.CBC(iv), backend=default_backend()).decryptor()
+        return _unpad(dec.update(ct) + dec.finalize())
+
+
+class AesCtrLayer(CipherLayer):
+    id = "aes-ctr";   label = "AES-256-CTR + HMAC-SHA3-256"
+    description = "Потоковый режим · без паддинга · SHA-3 аутентификация"
+    security = "Medium"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        n = os.urandom(16)
+        enc = Cipher(algorithms.AES(ek), modes.CTR(n), backend=default_backend()).encryptor()
+        ct  = enc.update(data) + enc.finalize()
+        tag = hashlib.sha3_256(mk + n + ct + AAD).digest()
+        return n + tag + ct                  # 16 + 32 + len(data)
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        n, tag, ct = data[:16], data[16:48], data[48:]
+        exp = hashlib.sha3_256(mk + n + ct + AAD).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("AES-CTR: ошибка аутентификации")
+        dec = Cipher(algorithms.AES(ek), modes.CTR(n), backend=default_backend()).decryptor()
+        return dec.update(ct) + dec.finalize()
+
+
+class CamelliaCbcLayer(CipherLayer):
+    id = "camellia";  label = "Camellia-256-CBC + HMAC-SHA3-256"
+    description = "Японский стандарт (NTT/Mitsubishi) · ISO/IEC 18033-3 · другое семейство алгоритмов"
+    security = "High"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv = os.urandom(16)
+        enc = Cipher(algorithms.Camellia(ek), modes.CBC(iv), backend=default_backend()).encryptor()
+        ct  = enc.update(_pad(data)) + enc.finalize()
+        tag = hashlib.sha3_256(mk + iv + ct + AAD).digest()
+        return iv + tag + ct
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv, tag, ct = data[:16], data[16:48], data[48:]
+        exp = hashlib.sha3_256(mk + iv + ct + AAD).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("Camellia: ошибка аутентификации")
+        dec = Cipher(algorithms.Camellia(ek), modes.CBC(iv), backend=default_backend()).decryptor()
+        return _unpad(dec.update(ct) + dec.finalize())
+
+
+class XChaCha20Layer(CipherLayer):
+    """XChaCha20: субключ из первых 12 байт нонса, остаток — nonce для ChaCha20."""
+    id = "xchacha20"; label = "XChaCha20 + HMAC-SHA3-512"
+    description = "Расширенный нонс 24 байта · HMAC-SHA3-512 · меньше коллизий nonce"
+    security = "High"
+
+    @staticmethod
+    def _derive_subkey(key: bytes, seed12: bytes) -> bytes:
+        return hashlib.sha3_256(key + seed12 + b"xchacha20_subkey").digest()
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        # nonce24 = [12 bytes subkey seed] + [12 bytes ChaCha20 nonce]
+        nonce24 = os.urandom(24)
+        subkey  = self._derive_subkey(ek, nonce24[:12])
+        ct = ChaCha20Poly1305(subkey).encrypt(nonce24[12:], data, AAD)
+        tag = hashlib.sha3_512(mk + nonce24 + ct + AAD).digest()
+        return nonce24 + tag + ct            # 24 + 64 + ciphertext
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        nonce24, tag, ct = data[:24], data[24:88], data[88:]
+        exp = hashlib.sha3_512(mk + nonce24 + ct + AAD).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("XChaCha20: ошибка аутентификации")
+        subkey = self._derive_subkey(ek, nonce24[:12])
+        return ChaCha20Poly1305(subkey).decrypt(nonce24[12:], ct, AAD)
+
+
+class Aes256CfbLayer(CipherLayer):
+    id = "aes-cfb";   label = "AES-256-CFB + HMAC-SHA256"
+    description = "Самосинхронизирующийся потоковый режим · устойчив к потере блоков"
+    security = "Medium"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv = os.urandom(16)
+        enc = Cipher(algorithms.AES(ek), modes.CFB(iv), backend=default_backend()).encryptor()
+        ct  = enc.update(data) + enc.finalize()
+        tag = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        return iv + tag + ct
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:32], kb[32:64]
+        iv, tag, ct = data[:16], data[16:48], data[48:]
+        exp = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("AES-CFB: ошибка аутентификации")
+        dec = Cipher(algorithms.AES(ek), modes.CFB(iv), backend=default_backend()).decryptor()
+        return dec.update(ct) + dec.finalize()
+
+
+class TripleDesCbcLayer(CipherLayer):
+    id = "3des";      label = "3DES-CBC + HMAC-SHA256  ⚠ Legacy"
+    description = "~112 бит эффективной безопасности · только для совместимости · медленный"
+    security = "Low"
+
+    def encrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:24], kb[32:64]
+        iv = os.urandom(8)
+        enc = Cipher(_TripleDES(ek), modes.CBC(iv), backend=default_backend()).encryptor()
+        ct  = enc.update(_pad(data, 8)) + enc.finalize()
+        tag = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        return iv + tag + ct                 # 8 + 32 + padded
+
+    def decrypt(self, kb: bytes, data: bytes) -> bytes:
+        ek, mk = kb[:24], kb[32:64]
+        iv, tag, ct = data[:8], data[8:40], data[40:]
+        exp = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
+        if not _hmac.compare_digest(exp, tag):
+            raise ValueError("3DES: ошибка аутентификации")
+        dec = Cipher(_TripleDES(ek), modes.CBC(iv), backend=default_backend()).decryptor()
+        return _unpad(dec.update(ct) + dec.finalize(), 8)
+
+
+# ─── Реестр ───────────────────────────────────────────────────────────────────
+
+CIPHER_REGISTRY: Dict[str, CipherLayer] = {
+    c.id: c for c in [
+        AesGcmLayer(), ChaCha20Layer(), AesSivLayer(),
+        AesCbcLayer(), AesCtrLayer(), Aes256CfbLayer(),
+        CamelliaCbcLayer(), XChaCha20Layer(), TripleDesCbcLayer(),
+    ]
+}
+
+CIPHER_INFO: Dict[str, dict] = {
+    cid: {"label": c.label, "description": c.description, "security": c.security}
+    for cid, c in CIPHER_REGISTRY.items()
+}
+
+
+# ─── KDF ──────────────────────────────────────────────────────────────────────
+
+def derive_key(password: str, salt: bytes, length: int, kdf_cfg: dict) -> bytes:
+    """Выводит ключевой материал из пароля. Поддерживает 4 алгоритма."""
+    ktype = kdf_cfg.get("type", "pbkdf2-sha256")
+
+    if ktype == "pbkdf2-sha256":
+        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt,
+                                   kdf_cfg.get("iterations", 500_000), length)
+    if ktype == "pbkdf2-sha512":
+        return hashlib.pbkdf2_hmac("sha512", password.encode(), salt,
+                                   kdf_cfg.get("iterations", 300_000), length)
+    if ktype == "scrypt":
+        kdf = Scrypt(salt=salt, length=length,
+                     n=kdf_cfg.get("n", 65536), r=8, p=1,
+                     backend=default_backend())
+        return kdf.derive(password.encode())
+    if ktype == "argon2id":
+        try:
+            from argon2.low_level import hash_secret_raw, Type
+            return hash_secret_raw(
+                password.encode(), salt,
+                time_cost=kdf_cfg.get("time_cost", 3),
+                memory_cost=kdf_cfg.get("memory_cost", 65536),
+                parallelism=kdf_cfg.get("parallelism", 4),
+                hash_len=length,
+                type=Type.ID,
+            )
+        except ImportError:
+            # Fallback если argon2-cffi не установлен
+            kdf = Scrypt(salt=salt, length=length, n=65536, r=8, p=1, backend=default_backend())
+            return kdf.derive(password.encode())
+
+    raise ValueError(f"Неизвестный KDF: {ktype}")
+
+
+KDF_INFO = {
+    "pbkdf2-sha256": {
+        "label": "PBKDF2-SHA256",
+        "description": "NIST-стандарт · настраиваемые итерации · быстрый",
+        "has_iterations": True,
+    },
+    "pbkdf2-sha512": {
+        "label": "PBKDF2-SHA512",
+        "description": "SHA-512 хеш · тяжелее SHA-256 · хорошо на 64-бит CPU",
+        "has_iterations": True,
+    },
+    "scrypt": {
+        "label": "scrypt",
+        "description": "Memory-hard · 64 МБ ОЗУ · сложно для ASIC/GPU атак",
+        "has_iterations": False,
+    },
+    "argon2id": {
+        "label": "Argon2id ★ (лучший)",
+        "description": "Password Hashing Competition winner · защита от GPU и side-channel",
+        "has_iterations": False,
+    },
+}
+
+
+# ─── Сжатие ───────────────────────────────────────────────────────────────────
+
+def compress_data(data: bytes, method: str) -> bytes:
+    if method == "none":   return data
+    if method == "zlib-1": return zlib.compress(data, 1)
+    if method == "zlib-9": return zlib.compress(data, 9)
+    if method == "bz2":    return bz2.compress(data, 9)
+    if method == "lzma":   return lzma.compress(data, preset=6)
+    return zlib.compress(data, 9)
+
+def decompress_data(data: bytes, method: str) -> bytes:
+    if method == "none":              return data
+    if method in ("zlib-1","zlib-9"): return zlib.decompress(data)
+    if method == "bz2":               return bz2.decompress(data)
+    if method == "lzma":              return lzma.decompress(data)
+    return zlib.decompress(data)
+
+COMPRESS_INFO = {
+    "none":   {"label": "Без сжатия",    "description": "Максимальная скорость"},
+    "zlib-1": {"label": "zlib (быстрый)","description": "Быстрое сжатие ~300 МБ/с"},
+    "zlib-9": {"label": "zlib (макс)",   "description": "Лучший уровень zlib"},
+    "bz2":    {"label": "bz2",           "description": "Лучше zlib, медленнее"},
+    "lzma":   {"label": "LZMA",          "description": "Максимальное сжатие, самый медленный"},
+}
+
+
+# ─── Пресеты ──────────────────────────────────────────────────────────────────
+
+PRESETS = {
+    "fast": {
+        "label": "Быстрый", "icon": "⚡",
+        "cipher_chain": ["aes-gcm"],
+        "kdf": {"type": "pbkdf2-sha256", "iterations": 100_000},
+        "compression": "zlib-1",
+        "description": "AES-256-GCM · PBKDF2-100k · zlib-fast",
+    },
+    "standard": {
+        "label": "Стандартный", "icon": "🔒",
+        "cipher_chain": ["aes-gcm", "chacha20"],
+        "kdf": {"type": "pbkdf2-sha256", "iterations": 500_000},
+        "compression": "zlib-9",
+        "description": "AES-GCM → ChaCha20 · PBKDF2-500k · zlib",
+    },
+    "paranoid": {
+        "label": "Параноид", "icon": "🛡",
+        "cipher_chain": ["aes-gcm", "chacha20", "camellia"],
+        "kdf": {"type": "scrypt", "n": 65536},
+        "compression": "bz2",
+        "description": "AES → ChaCha20 → Camellia · scrypt · bz2",
+    },
+    "ultra": {
+        "label": "Ультра", "icon": "☢",
+        "cipher_chain": ["aes-gcm", "chacha20", "camellia", "aes-siv"],
+        "kdf": {"type": "argon2id", "time_cost": 4, "memory_cost": 131072, "parallelism": 4},
+        "compression": "lzma",
+        "description": "4 слоя · Argon2id · LZMA",
+    },
+    "asymmetric": {
+        "label": "Хаос", "icon": "🌀",
+        "cipher_chain": ["aes-cbc", "xchacha20", "aes-ctr", "camellia", "chacha20"],
+        "kdf": {"type": "argon2id", "time_cost": 5, "memory_cost": 262144, "parallelism": 8},
+        "compression": "lzma",
+        "description": "5 разных слоёв · Argon2id-256MB · LZMA",
+    },
+}
+
+DEFAULT_CONFIG = {
+    "cipher_chain": ["aes-gcm", "chacha20"],
+    "kdf": {"type": "pbkdf2-sha256", "iterations": 500_000},
+    "compression": "zlib-9",
+}
+
+
+# ─── Пароль ───────────────────────────────────────────────────────────────────
 
 def save_password_hash(password: str) -> None:
-    """Сохраняет хеш мастер-пароля (PBKDF2-SHA256, 200 000 итераций)."""
     salt = secrets.token_bytes(16)
-    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 200_000, 32)
-    with open(CONFIG_FILE, 'w') as f:
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, 32)
+    with open(CONFIG_FILE, "w") as f:
         json.dump({"salt": salt.hex(), "hash": h.hex()}, f)
 
-
 def verify_password(password: str) -> bool:
-    """Проверяет мастер-пароль по сохранённому хешу."""
     if not os.path.exists(CONFIG_FILE):
         return False
-    with open(CONFIG_FILE, 'r') as f:
+    with open(CONFIG_FILE, "r") as f:
         cfg = json.load(f)
-    salt = bytes.fromhex(cfg["salt"])
+    salt   = bytes.fromhex(cfg["salt"])
     stored = bytes.fromhex(cfg["hash"])
-    h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 200_000, 32)
-    return h == stored
-
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000, 32)
+    return _hmac.compare_digest(h, stored)
 
 def is_first_run() -> bool:
-    """True, если конфиг-файл ещё не создан."""
     return not os.path.exists(CONFIG_FILE)
 
+def read_metadata(filepath: str) -> dict:
+    with open(filepath, "rb") as f:
+        meta_len = int.from_bytes(f.read(4), "big")
+        return json.loads(f.read(meta_len).decode())
 
-# ─── Шифратор ─────────────────────────────────────────────────────────────────
+
+# ─── Обратная совместимость (v2.0) ────────────────────────────────────────────
+
+def _decrypt_v2_legacy(password: str, salt: bytes, data: bytes) -> bytes:
+    """Расшифровывает старые файлы формата v2.0."""
+    master = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 500_000, 64)
+    aes_key, chacha_key = master[:32], master[32:64]
+
+    inner: Optional[bytes] = None
+    for pos in range(min(96, len(data) - 28)):
+        try:
+            nonce = data[pos:pos + 12]
+            inner = ChaCha20Poly1305(chacha_key).decrypt(nonce, data[pos + 12:], AAD)
+            break
+        except Exception:
+            continue
+    if inner is None:
+        raise ValueError("v2.0: невозможно расшифровать")
+
+    iv_aes, tag, ct = inner[:12], inner[12:28], inner[28:]
+    dec = Cipher(algorithms.AES(aes_key), modes.GCM(iv_aes, tag), backend=default_backend()).decryptor()
+    dec.authenticate_additional_data(AAD)
+    padded = dec.update(ct) + dec.finalize()
+    pad_len = padded[-1]
+    raw = padded[:-pad_len] if 1 <= pad_len <= 16 else padded
+    return zlib.decompress(raw)
+
+
+# ─── Главный класс ────────────────────────────────────────────────────────────
 
 class XaletherChaos:
     """
-    Каскадный шифратор файлов.
+    Каскадный шифратор файлов v2.1.
 
     Порядок шифрования:
-      1. zlib-сжатие
-      2. Паддинг до 16 байт
-      3. AES-256-GCM (с AAD 'XALETHER_CRYPT_V2')
-      4. ChaCha20-Poly1305 (с AAD 'XALETHER_CRYPT_V2')
-      5. Добавление случайного шума в начало (16-79 байт)
+      1. compress(data)
+      2. layer[0].encrypt  (innermost)
+      3. layer[1].encrypt
+         ...
+      N. layer[N-1].encrypt  (outermost)
+      noise prepend
+
+    Расшифровка — строго наоборот.
     """
 
-    def __init__(self, password: str, salt: Optional[bytes] = None) -> None:
-        self.salt = salt if salt else secrets.token_bytes(SALT_SIZE)
-        master = hashlib.pbkdf2_hmac('sha256', password.encode(), self.salt, 500_000, 64)
-        self.aes_key: bytes = master[0:32]
-        self.chacha_key: bytes = master[32:64]
+    def __init__(
+        self,
+        password: str,
+        salt: Optional[bytes] = None,
+        config: Optional[dict] = None,
+    ) -> None:
+        self.config = config or DEFAULT_CONFIG.copy()
+        self.salt   = salt if salt else secrets.token_bytes(SALT_SIZE)
+
+        chain = self.config["cipher_chain"]
+        master = derive_key(
+            password, self.salt,
+            KEY_BLOCK * max(1, len(chain)),
+            self.config.get("kdf", {"type": "pbkdf2-sha256", "iterations": 500_000}),
+        )
+        self._keys: List[bytes] = [
+            master[i * KEY_BLOCK:(i + 1) * KEY_BLOCK] for i in range(len(chain))
+        ]
 
     def __del__(self) -> None:
-        if hasattr(self, 'aes_key'):
-            self.aes_key = b'\x00' * 32
-        if hasattr(self, 'chacha_key'):
-            self.chacha_key = b'\x00' * 32
+        if hasattr(self, "_keys"):
+            self._keys = []
         gc.collect()
 
-    # ── внутренние хелперы ───────────────────────────────────────────────────
-
-    @staticmethod
-    def _pad(data: bytes, block_size: int = 16) -> bytes:
-        pad_len = block_size - (len(data) % block_size)
-        return data + bytes([pad_len] * pad_len)
-
-    @staticmethod
-    def _unpad(data: bytes) -> bytes:
-        pad_len = data[-1]
-        return data if pad_len > 16 else data[:-pad_len]
-
-    # ── шифрование / расшифровка ─────────────────────────────────────────────
+    # ── шифрование ────────────────────────────────────────────────────────────
 
     def encrypt(
         self,
@@ -101,64 +502,44 @@ class XaletherChaos:
         permission_code: Optional[str] = None,
         content_type: str = "file",
     ) -> Tuple[bytes, dict]:
-        """Шифрует сырые байты, возвращает (шифртекст, метаданные)."""
-        data = zlib.compress(data, 9)
+        chain = self.config["cipher_chain"]
+        compression = self.config.get("compression", "zlib-9")
 
-        # Слой 1: AES-256-GCM
-        iv_aes = secrets.token_bytes(12)
-        enc = Cipher(
-            algorithms.AES(self.aes_key), modes.GCM(iv_aes), backend=default_backend()
-        ).encryptor()
-        enc.authenticate_additional_data(b'XALETHER_CRYPT_V2')
-        data = enc.update(self._pad(data)) + enc.finalize()
-        data = iv_aes + enc.tag + data
+        data = compress_data(data, compression)
+        for i, cid in enumerate(chain):
+            data = CIPHER_REGISTRY[cid].encrypt(self._keys[i], data)
 
-        # Слой 2: ChaCha20-Poly1305
-        iv_cc = secrets.token_bytes(12)
-        chacha = ChaCha20Poly1305(self.chacha_key)
-        data = iv_cc + chacha.encrypt(iv_cc, data, b'XALETHER_CRYPT_V2')
-
-        # Случайный шум в начале (затрудняет анализ структуры файла)
-        noise = secrets.token_bytes(secrets.randbelow(64) + 16)
+        noise_size = secrets.randbelow(64) + 16
+        noise = secrets.token_bytes(noise_size)
 
         metadata = {
-            "version": "2.0",
+            "version": "2.1",
             "mode": mode,
             "content_type": content_type,
+            "cipher_chain": chain,
+            "kdf": self.config.get("kdf"),
+            "compression": compression,
+            "noise_size": noise_size,
             "hwid": get_hwid() if mode == "personal" else None,
             "permission_code": permission_code if mode == "permission" else None,
         }
         return noise + data, metadata
 
-    def decrypt(self, data: bytes) -> bytes:
-        """
-        Расшифровывает шифртекст.
-        Скользящим окном ищет начало ChaCha20-nonce (пропускает шум).
-        """
-        inner: Optional[bytes] = None
-        for pos in range(min(96, len(data) - 12)):
-            try:
-                iv_cc = data[pos:pos + 12]
-                inner = ChaCha20Poly1305(self.chacha_key).decrypt(
-                    iv_cc, data[pos + 12:], b'XALETHER_CRYPT_V2'
-                )
-                break
-            except Exception:
-                continue
+    def decrypt(self, data: bytes, metadata: dict) -> bytes:
+        noise_size = metadata.get("noise_size", 0)
+        chain      = metadata["cipher_chain"]
+        compression= metadata.get("compression", "zlib-9")
 
-        if inner is None:
-            raise ValueError("Неверный пароль или файл повреждён")
+        data = data[noise_size:]
+        for i in range(len(chain) - 1, -1, -1):
+            layer = CIPHER_REGISTRY.get(chain[i])
+            if layer is None:
+                raise ValueError(f"Неизвестный шифр: {chain[i]}")
+            data = layer.decrypt(self._keys[i], data)
 
-        iv_aes = inner[:12]
-        tag = inner[12:28]
-        ciphertext = inner[28:]
-        dec = Cipher(
-            algorithms.AES(self.aes_key), modes.GCM(iv_aes, tag), backend=default_backend()
-        ).decryptor()
-        dec.authenticate_additional_data(b'XALETHER_CRYPT_V2')
-        return zlib.decompress(self._unpad(dec.update(ciphertext) + dec.finalize()))
+        return decompress_data(data, compression)
 
-    # ── файловые операции ────────────────────────────────────────────────────
+    # ── файловые операции ─────────────────────────────────────────────────────
 
     def encrypt_file(
         self,
@@ -170,33 +551,26 @@ class XaletherChaos:
         content_type: str = "file",
         progress_cb: ProgressCallback = None,
     ) -> Tuple[str, dict]:
-        """Шифрует файл и записывает результат в .xalether."""
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             data = f.read()
-        if progress_cb:
-            progress_cb(15)
+        if progress_cb: progress_cb(10)
 
         encrypted, metadata = self.encrypt(data, mode, permission_code, content_type)
-        if progress_cb:
-            progress_cb(75)
+        if progress_cb: progress_cb(80)
 
         if output is None:
-            output = filepath + '.xalether'
-
+            output = filepath + ".xalether"
         meta_json = json.dumps(metadata).encode()
-        with open(output, 'wb') as f:
-            f.write(len(meta_json).to_bytes(4, 'big'))
+        with open(output, "wb") as f:
+            f.write(len(meta_json).to_bytes(4, "big"))
             f.write(meta_json)
             f.write(self.salt)
             f.write(encrypted)
-        if progress_cb:
-            progress_cb(92)
+        if progress_cb: progress_cb(95)
 
         if remove_original:
             os.remove(filepath)
-        if progress_cb:
-            progress_cb(100)
-
+        if progress_cb: progress_cb(100)
         return output, metadata
 
     def decrypt_file(
@@ -208,14 +582,12 @@ class XaletherChaos:
         remove_encrypted: bool = False,
         progress_cb: ProgressCallback = None,
     ) -> Tuple[str, dict]:
-        """Расшифровывает .xalether файл. Проверяет HWID и коды разрешений."""
-        with open(filepath, 'rb') as f:
-            meta_len = int.from_bytes(f.read(4), 'big')
+        with open(filepath, "rb") as f:
+            meta_len = int.from_bytes(f.read(4), "big")
             metadata = json.loads(f.read(meta_len).decode())
-            salt = f.read(SALT_SIZE)
-            encrypted = f.read()
-        if progress_cb:
-            progress_cb(15)
+            salt     = f.read(SALT_SIZE)
+            encrypted= f.read()
+        if progress_cb: progress_cb(10)
 
         mode = metadata.get("mode", "transfer")
         if mode == "personal" and metadata.get("hwid") != get_hwid():
@@ -225,31 +597,31 @@ class XaletherChaos:
                 raise ValueError("Требуется код разрешения")
             if not use_permission(permission_code, get_hwid()):
                 raise ValueError("Неверный или просроченный код разрешения")
-        if progress_cb:
-            progress_cb(30)
+        if progress_cb: progress_cb(20)
 
-        # Деривируем ключи из соли, хранящейся в файле
-        decryptor = XaletherChaos(password, salt)
-        decrypted = decryptor.decrypt(encrypted)
-        if progress_cb:
-            progress_cb(85)
+        # Выбираем стратегию расшифровки по версии файла
+        version = metadata.get("version", "2.0")
+        if version == "2.0":
+            decrypted = _decrypt_v2_legacy(password, salt, encrypted)
+        else:
+            config = {
+                "cipher_chain": metadata["cipher_chain"],
+                "kdf":          metadata["kdf"],
+                "compression":  metadata.get("compression", "zlib-9"),
+            }
+            dec = XaletherChaos(password, salt, config)
+            if progress_cb: progress_cb(50)
+            decrypted = dec.decrypt(encrypted, metadata)
+
+        if progress_cb: progress_cb(88)
 
         if output is None:
-            output = filepath[:-9] if filepath.endswith('.xalether') else filepath + '.decrypted'
+            output = filepath[:-9] if filepath.endswith(".xalether") else filepath + ".decrypted"
 
-        with open(output, 'wb') as f:
+        with open(output, "wb") as f:
             f.write(decrypted)
 
         if remove_encrypted:
             os.remove(filepath)
-        if progress_cb:
-            progress_cb(100)
-
+        if progress_cb: progress_cb(100)
         return output, metadata
-
-
-def read_metadata(filepath: str) -> dict:
-    """Читает метаданные из .xalether файла без расшифровки."""
-    with open(filepath, 'rb') as f:
-        meta_len = int.from_bytes(f.read(4), 'big')
-        return json.loads(f.read(meta_len).decode())
