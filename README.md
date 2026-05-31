@@ -181,6 +181,48 @@ xalether-crypt/
 
 ---
 
+## 📥 Скачать готовый исполняемый файл
+
+Если вы не хотите собирать проект самостоятельно, скачайте готовый исполняемый файл для вашей ОС:
+
+1. **Перейдите в [Releases](https://github.com/mibuchik/xalether-crypt/releases)**
+2. **Скачайте файл для вашей системы:**
+   - **Linux**: `XaletherCrypt-Linux`
+   - **Windows**: `XaletherCrypt-Windows.exe`
+   - **macOS**: `XaletherCrypt-macOS`
+3. **Запустите файл:**
+   - **Linux**: `chmod +x XaletherCrypt-Linux && ./XaletherCrypt-Linux`
+   - **Windows**: Просто запустите `XaletherCrypt-Windows.exe`
+   - **macOS**: `chmod +x XaletherCrypt-macOS && ./XaletherCrypt-macOS`
+
+---
+
+## 📦 Сборка из исходного кода
+
+### Linux
+```bash
+git clone https://github.com/mibuchik/xalether-crypt.git
+cd xalether-crypt
+./build.sh
+```
+
+### Windows
+```bash
+git clone https://github.com/mibuchik/xalether-crypt.git
+cd xalether-crypt
+build_windows.bat
+```
+
+### macOS
+```bash
+git clone https://github.com/mibuchik/xalether-crypt.git
+cd xalether-crypt
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
+---
+
 ## Лицензия
 
 MIT
