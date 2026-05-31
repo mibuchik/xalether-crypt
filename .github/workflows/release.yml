@@ -44,19 +44,29 @@ jobs:
         build_windows.bat
         move dist\XaletherCrypt.exe dist\XaletherCrypt-Windows.exe
 
-    - name: Build executable (macOS)
+- name: Build executable (macOS)
       if: matrix.os == 'macos-latest'
       shell: bash
       run: |
         chmod +x build_macos.sh
         ./build_macos.sh
         mv dist/XaletherCrypt dist/XaletherCrypt-macOS
-    
-    - name: Verify build output
+
+    - name: Verify build output (Linux/macOS)
+      if: matrix.os != 'windows-latest'
+      shell: bash
       run: |
         echo "Build output structure:"
         find . -name "XaletherCrypt*" -type f 2>/dev/null || true
         ls -la dist/ 2>/dev/null || true
+
+    - name: Verify build output (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: cmd
+      run: |
+        echo Build output structure:
+        dir /s /b *XaletherCrypt* 2>nul || echo No files found
+        if exist dist\ dir dist\ || echo dist directory not found
   
   release:
     needs: build
@@ -81,6 +91,7 @@ jobs:
         path: dist/
     
     - name: Display structure and find files
+      shell: bash
       run: |
         echo "Artifacts structure:"
         find artifacts -type f 2>/dev/null || true
