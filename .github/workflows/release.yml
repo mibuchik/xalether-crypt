@@ -31,6 +31,7 @@ jobs:
     
     - name: Build executable (Linux)
       if: matrix.os == 'ubuntu-latest'
+      shell: bash
       run: |
         chmod +x build.sh
         ./build.sh
@@ -38,12 +39,14 @@ jobs:
 
     - name: Build executable (Windows)
       if: matrix.os == 'windows-latest'
+      shell: cmd
       run: |
-        ./build_windows.bat
-        mv dist/XaletherCrypt.exe dist/XaletherCrypt-Windows.exe
+        build_windows.bat
+        move dist\XaletherCrypt.exe dist\XaletherCrypt-Windows.exe
 
     - name: Build executable (macOS)
       if: matrix.os == 'macos-latest'
+      shell: bash
       run: |
         chmod +x build_macos.sh
         ./build_macos.sh
