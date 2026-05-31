@@ -2,7 +2,7 @@
 """
 XALETHER CRYPT v2.2 — PyQt5 GUI.
 Тёмная тема: #1A1A1A / #8A5CF5.
-Новое: шредер, проверка целостности, контекстное меню Windows.
+Новое: шредер, проверка целостности.
 """
 
 import copy, os, shutil, tempfile
@@ -34,7 +34,7 @@ from utils import (
     load_settings, save_settings, generate_password,
     shred_file,
 )
-import context_menu as _ctx
+
 
 
 # ─── Стиль ────────────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ import context_menu as _ctx
 STYLESHEET = """
 QWidget {
     background-color: #1A1A1A; color: #E3E3E3;
-    font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px;
+    font-family: "Segoe UI", Arial, sans-serif; font-size: 13px;
 }
 QMainWindow, QDialog { background-color: #1A1A1A; }
 QLabel { color: #E3E3E3; background: transparent; }
@@ -70,7 +70,7 @@ QLineEdit:focus { border-color: #8A5CF5; }
 
 QTextEdit {
     background-color: #111; color: #D0D0D0; border: 1px solid #333; border-radius: 4px;
-    font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace; font-size: 12px;
+    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace; font-size: 12px;
     selection-background-color: #8A5CF5;
 }
 
@@ -875,40 +875,7 @@ class MainWindow(QMainWindow):
         summary_lay.addWidget(self._summary_lbl)
         lay.addWidget(summary_box)
 
-        # Контекстное меню Windows
-        ctx_box = QGroupBox("Контекстное меню Windows")
-        ctx_lay = QVBoxLayout(ctx_box)
-        ctx_lay.setSpacing(8)
-
-        ctx_info = QLabel(
-            "Добавляет пункты «Зашифровать Xalether» и «Расшифровать Xalether»\n"
-            "в контекстное меню Проводника (ПКМ по файлу или папке).\n"
-            "Не требует прав администратора."
-        )
-        ctx_info.setStyleSheet("color: #888; font-size: 11px;")
-        ctx_info.setWordWrap(True)
-        ctx_lay.addWidget(ctx_info)
-
-        self._ctx_status_lbl = QLabel("")
-        self._ctx_status_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
-        ctx_lay.addWidget(self._ctx_status_lbl)
-
-        ctx_btn_row = QHBoxLayout()
-        ctx_btn_row.setSpacing(8)
-        install_btn = QPushButton("✅ Добавить в контекстное меню")
-        install_btn.clicked.connect(self._install_ctx_menu)
-        uninstall_btn = QPushButton("❌ Убрать из контекстного меню")
-        uninstall_btn.setObjectName("danger")
-        uninstall_btn.clicked.connect(self._uninstall_ctx_menu)
-        reg_btn = QPushButton("📄 Сохранить .reg файлы")
-        reg_btn.setToolTip("Сохранить install/uninstall .reg файлы с текущими путями")
-        reg_btn.clicked.connect(self._save_reg_files)
-        ctx_btn_row.addWidget(install_btn)
-        ctx_btn_row.addWidget(uninstall_btn)
-        ctx_btn_row.addWidget(reg_btn)
-        ctx_lay.addLayout(ctx_btn_row)
-        lay.addWidget(ctx_box)
-        self._refresh_ctx_status()
+        
 
         # Сохранить
         save_btn = QPushButton("💾  Сохранить настройки")
@@ -1273,52 +1240,7 @@ class MainWindow(QMainWindow):
             self._log(f"⚠️ {msg}")
             QMessageBox.warning(self, "⚠️ Проверка целостности", msg)
 
-    # ── контекстное меню Windows ──────────────────────────────────────────────
-
-    def _install_ctx_menu(self) -> None:
-        ok, msg = _ctx.install()
-        if ok:
-            QMessageBox.information(self, "Контекстное меню", msg)
-            self._log(f"✅ {msg}")
-        else:
-            QMessageBox.critical(self, "Ошибка", msg)
-            self._log(f"❌ {msg}")
-        self._refresh_ctx_status()
-
-    def _uninstall_ctx_menu(self) -> None:
-        ok, msg = _ctx.uninstall()
-        if ok:
-            QMessageBox.information(self, "Контекстное меню", msg)
-            self._log(f"✅ {msg}")
-        else:
-            QMessageBox.critical(self, "Ошибка", msg)
-            self._log(f"❌ {msg}")
-        self._refresh_ctx_status()
-
-    def _save_reg_files(self) -> None:
-        out_dir = QFileDialog.getExistingDirectory(self, "Папка для .reg файлов")
-        if not out_dir:
-            return
-        try:
-            inst, unin = _ctx.generate_reg_files(out_dir)
-            QMessageBox.information(
-                self, "REG файлы сохранены",
-                f"Файлы сохранены:\n{inst}\n{unin}\n\n"
-                "Запустите install_context_menu.reg для добавления меню."
-            )
-            self._log(f"✅ .reg файлы сохранены в {out_dir}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", str(e))
-
-    def _refresh_ctx_status(self) -> None:
-        if not hasattr(self, "_ctx_status_lbl"):
-            return
-        if _ctx.is_installed():
-            self._ctx_status_lbl.setText("✅ Контекстное меню установлено")
-            self._ctx_status_lbl.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        else:
-            self._ctx_status_lbl.setText("❌ Контекстное меню не установлено")
-            self._ctx_status_lbl.setStyleSheet("color: #FF6B6B; font-weight: bold;")
+    
 
     # ── запуск потока ─────────────────────────────────────────────────────────
 

@@ -3,7 +3,7 @@
 XALETHER CRYPT v2.1 — Модульная каскадная криптосистема.
 
 Шифры: AES-256-GCM · ChaCha20-Poly1305 · AES-256-SIV
-       AES-256-CBC · AES-256-CTR · Camellia-256-CBC · 3DES-CBC
+       AES-256-CBC · AES-256-CTR · Camellia-256-CBC
 
 KDF:   PBKDF2-SHA256 · PBKDF2-SHA512 · scrypt · Argon2id
 
@@ -20,11 +20,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305, AESSIV
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
-# TripleDES переехал в decrepit в cryptography >= 43
-try:
-    from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES as _TripleDES
-except ImportError:
-    from cryptography.hazmat.primitives.ciphers.algorithms import TripleDES as _TripleDES  # type: ignore
+
 
 from utils import get_hwid
 from permissions import use_permission
@@ -227,27 +223,7 @@ class Aes256CfbLayer(CipherLayer):
         return dec.update(ct) + dec.finalize()
 
 
-class TripleDesCbcLayer(CipherLayer):
-    id = "3des";      label = "3DES-CBC + HMAC-SHA256  ⚠ Legacy"
-    description = "~112 бит эффективной безопасности · только для совместимости · медленный"
-    security = "Low"
 
-    def encrypt(self, kb: bytes, data: bytes) -> bytes:
-        ek, mk = kb[:24], kb[32:64]
-        iv = os.urandom(8)
-        enc = Cipher(_TripleDES(ek), modes.CBC(iv), backend=default_backend()).encryptor()
-        ct  = enc.update(_pad(data, 8)) + enc.finalize()
-        tag = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
-        return iv + tag + ct                 # 8 + 32 + padded
-
-    def decrypt(self, kb: bytes, data: bytes) -> bytes:
-        ek, mk = kb[:24], kb[32:64]
-        iv, tag, ct = data[:8], data[8:40], data[40:]
-        exp = _hmac.new(mk, iv + ct + AAD, hashlib.sha256).digest()
-        if not _hmac.compare_digest(exp, tag):
-            raise ValueError("3DES: ошибка аутентификации")
-        dec = Cipher(_TripleDES(ek), modes.CBC(iv), backend=default_backend()).decryptor()
-        return _unpad(dec.update(ct) + dec.finalize(), 8)
 
 
 # ─── Реестр ───────────────────────────────────────────────────────────────────
@@ -256,7 +232,7 @@ CIPHER_REGISTRY: Dict[str, CipherLayer] = {
     c.id: c for c in [
         AesGcmLayer(), ChaCha20Layer(), AesSivLayer(),
         AesCbcLayer(), AesCtrLayer(), Aes256CfbLayer(),
-        CamelliaCbcLayer(), XChaCha20Layer(), TripleDesCbcLayer(),
+        CamelliaCbcLayer(), XChaCha20Layer(),
     ]
 }
 
