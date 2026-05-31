@@ -52,11 +52,11 @@ jobs:
         ./build_macos.sh
         mv dist/XaletherCrypt dist/XaletherCrypt-macOS
     
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ matrix.os }}-executable
-        path: dist/
+    - name: Verify build output
+      run: |
+        echo "Build output structure:"
+        find . -name "XaletherCrypt*" -type f 2>/dev/null || true
+        ls -la dist/ 2>/dev/null || true
   
   release:
     needs: build
@@ -68,8 +68,25 @@ jobs:
       with:
         path: artifacts
     
-    - name: Display structure
-      run: find artifacts -type f
+    - name: Verify build output
+      run: |
+        echo "Build output structure:"
+        find . -name "XaletherCrypt*" -type f 2>/dev/null || true
+        ls -la dist/ 2>/dev/null || true
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.os }}-executable
+        path: dist/
+    
+    - name: Display structure and find files
+      run: |
+        echo "Artifacts structure:"
+        find artifacts -type f 2>/dev/null || true
+        echo ""
+        echo "Looking for XaletherCrypt files:"
+        find artifacts -name "*XaletherCrypt*" -type f 2>/dev/null || true
     
     - name: Read version
       id: version
@@ -83,6 +100,6 @@ jobs:
         draft: false
         prerelease: false
         files: |
-          artifacts/ubuntu-latest-executable/dist/XaletherCrypt-Linux
-          artifacts/windows-latest-executable/dist/XaletherCrypt-Windows.exe
-          artifacts/macos-latest-executable/dist/XaletherCrypt-macOS
+          artifacts/**/*XaletherCrypt-Linux*
+          artifacts/**/*XaletherCrypt-Windows*
+          artifacts/**/*XaletherCrypt-macOS*
