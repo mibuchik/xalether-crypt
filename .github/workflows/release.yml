@@ -1,0 +1,80 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Build executable
+      run: |
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          chmod +x build.sh
+          ./build.sh
+          mv dist/XaletherCrypt dist/XaletherCrypt-Linux
+        elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          ./build_windows.bat
+          mv dist/XaletherCrypt.exe dist/XaletherCrypt-Windows.exe
+        else
+          chmod +x build_macos.sh
+          ./build_macos.sh
+          mv dist/XaletherCrypt dist/XaletherCrypt-macOS
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.os }}-executable
+        path: dist/
+  
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    
+    - name: Display structure
+      run: find artifacts -type f
+    
+    - name: Read version
+      id: version
+      run: echo "VERSION=$(cat version.txt)" >> $GITHUB_OUTPUT
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.VERSION }}
+        name: Xalether Crypt v${{ steps.version.outputs.VERSION }}
+        draft: false
+        prerelease: false
+        files: |
+          artifacts/ubuntu-latest-executable/dist/XaletherCrypt-Linux
+          artifacts/windows-latest-executable/dist/XaletherCrypt-Windows.exe
+          artifacts/macos-latest-executable/dist/XaletherCrypt-macOS
